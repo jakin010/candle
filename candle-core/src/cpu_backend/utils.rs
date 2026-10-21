@@ -362,10 +362,18 @@ pub fn unary_map_vec<T: Copy, U: Copy, F: FnMut(T) -> U, FV: FnMut(&[T], &mut [U
     }
 }
 
-// Below this many logical elements the barrier-pool split costs more than it saves.
+// Below this many logical elements the parallel split costs more than it saves.
 const PAR_ELEMWISE_MIN: usize = 64 * 1024;
 // Per-unit span: big enough to amortize dispatch, small enough to balance.
 const PAR_ELEMWISE_CHUNK: usize = 16 * 1024;
+
+// Runs units 0..n_units in parallel on rayon, the pool candle's matmuls (gemm)
+// use too. With a pool of their own, element-wise ops and matmuls compete for
+// the cores: one pool's spinning workers slow the other pool's work down.
+fn par_units<F: Fn(std::ops::Range<usize>) + Sync>(n_units: usize, f: F) {
+    use rayon::prelude::*;
+    (0..n_units).into_par_iter().for_each(|u| f(u..u + 1));
+}
 
 pub fn unary_map_vec_par<
     T: Copy + Send + Sync,
@@ -384,7 +392,7 @@ pub fn unary_map_vec_par<
             let mut ys: Vec<U> = Vec::with_capacity(len);
             let ys_ptr = ys.as_mut_ptr() as usize;
             let n_units = len.div_ceil(PAR_ELEMWISE_CHUNK);
-            crate::utils::barrier_pool().execute_chunked(n_units, |range| {
+            par_units(n_units, |range| {
                 let ys_ptr = ys_ptr as *mut U;
                 for unit in range {
                     let lo = unit * PAR_ELEMWISE_CHUNK;
@@ -429,7 +437,7 @@ pub fn binary_map_vec_par<
     let mut ys: Vec<T> = Vec::with_capacity(el_count);
     let ys_ptr = ys.as_mut_ptr() as usize;
     let n_units = el_count.div_ceil(PAR_ELEMWISE_CHUNK);
-    crate::utils::barrier_pool().execute_chunked(n_units, |range| {
+    par_units(n_units, |range| {
         let ys_ptr = ys_ptr as *mut T;
         for unit in range {
             let mut dst_offset = unit * PAR_ELEMWISE_CHUNK;
