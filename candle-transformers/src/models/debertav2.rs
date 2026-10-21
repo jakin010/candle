@@ -284,11 +284,12 @@ struct XSoftmax {}
 impl XSoftmax {
     pub fn apply(input: &Tensor, mask: &Tensor, dim: D, device: &Device) -> Result<Tensor> {
         // NOTE: At the time of this writing, candle does not have a logical-not operator.
-        let mut rmask = mask.broadcast_as(input.shape())?.to_dtype(DType::F32)?;
-
-        rmask = rmask
+        // Compare before broadcasting: the same values, without converting and
+        // comparing a (batch, heads, len, len) copy of the mask in every layer.
+        let rmask = mask
+            .to_dtype(DType::F32)?
             .broadcast_lt(&Tensor::new(&[1.0_f32], device)?)?
-            .to_dtype(DType::U8)?;
+            .broadcast_as(input.shape())?;
 
         let min_value_tensor = Tensor::new(&[f32::MIN], device)?.broadcast_as(input.shape())?;
         let mut output = rmask.where_cond(&min_value_tensor, input)?;

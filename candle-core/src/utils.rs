@@ -380,6 +380,13 @@ pub fn init_global_threadpool() {
 }
 
 fn default_num_threads() -> usize {
+    // Every matmul asks for the thread count, and on Linux the core count comes
+    // from parsing /proc/cpuinfo, so compute it once.
+    static DEFAULT: OnceLock<usize> = OnceLock::new();
+    *DEFAULT.get_or_init(detect_num_threads)
+}
+
+fn detect_num_threads() -> usize {
     let physical = {
         #[cfg(target_os = "macos")]
         {
@@ -397,7 +404,12 @@ fn default_num_threads() -> usize {
             num_cpus::get_physical()
         }
     };
-    physical.max(1) // safeguard against bad number
+    // The counts above describe the whole machine. The process may be allowed
+    // fewer CPUs: its affinity mask (taskset) or, in a container, a cgroup CPU
+    // quota, both of which `available_parallelism` reports. More threads than
+    // that only time-slice, and spinning workers burn the quota.
+    let allowed = std::thread::available_parallelism().map_or(physical, |n| n.get());
+    physical.min(allowed).max(1) // safeguard against bad number
 }
 
 fn rayon_num_threads() -> usize {
@@ -583,6 +595,44 @@ pub fn set_thread_affinity() {
     }
 }
 
+// 0: not decided yet (read CANDLE_FAST_GELU on first use), 1: off, 2: on.
+#[cfg(feature = "fast-gelu")]
+static FAST_GELU: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Whether f32 GELU on the CPU uses the vectorized approximations in
+/// [`crate::cpu::fast_math`] instead of libm's `erff`/`tanhf`.
+///
+/// Only in builds with the `fast-gelu` feature, where it is on unless
+/// [`set_fast_gelu`] or `CANDLE_FAST_GELU=0` turns it off. It covers `gelu_erf`
+/// and, in builds without `mkl` or `accelerate` (which bring their own vector
+/// kernels), `gelu`. The approximations are within 1e-6 of the exact values;
+/// without the feature, results are bit-for-bit those of libm.
+#[cfg(feature = "fast-gelu")]
+pub fn fast_gelu() -> bool {
+    match FAST_GELU.load(Ordering::Relaxed) {
+        0 => {
+            let on = !std::env::var("CANDLE_FAST_GELU")
+                .is_ok_and(|v| v == "0" || v.eq_ignore_ascii_case("false"));
+            // A concurrent `set_fast_gelu` wins over the environment.
+            let _ = FAST_GELU.compare_exchange(
+                0,
+                if on { 2 } else { 1 },
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            FAST_GELU.load(Ordering::Relaxed) == 2
+        }
+        state => state == 2,
+    }
+}
+
+/// Turns the fast GELU path on or off for the whole process, overriding
+/// `CANDLE_FAST_GELU`. See [`fast_gelu`].
+#[cfg(feature = "fast-gelu")]
+pub fn set_fast_gelu(enabled: bool) {
+    FAST_GELU.store(if enabled { 2 } else { 1 }, Ordering::Relaxed);
+}
+
 pub fn has_accelerate() -> bool {
     cfg!(feature = "accelerate")
 }
@@ -613,6 +663,23 @@ pub fn with_simd128() -> bool {
 
 pub fn with_f16c() -> bool {
     crate::cpu::features::get().f16c
+}
+
+#[cfg(test)]
+mod thread_count_tests {
+    use super::default_num_threads;
+
+    #[test]
+    fn default_thread_count_fits_the_allowed_cpus() {
+        // available_parallelism covers the affinity mask and a cgroup CPU quota.
+        let allowed = std::thread::available_parallelism().map_or(usize::MAX, |n| n.get());
+        let threads = default_num_threads();
+        assert!(
+            (1..=allowed).contains(&threads),
+            "{threads} threads for {allowed} allowed CPUs"
+        );
+        assert_eq!(default_num_threads(), threads);
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
