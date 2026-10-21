@@ -363,9 +363,9 @@ pub fn unary_map_vec<T: Copy, U: Copy, F: FnMut(T) -> U, FV: FnMut(&[T], &mut [U
 }
 
 // Below this many logical elements the parallel split costs more than it saves.
-const PAR_ELEMWISE_MIN: usize = 64 * 1024;
+pub(crate) const PAR_ELEMWISE_MIN: usize = 64 * 1024;
 // Per-unit span: big enough to amortize dispatch, small enough to balance.
-const PAR_ELEMWISE_CHUNK: usize = 16 * 1024;
+pub(crate) const PAR_ELEMWISE_CHUNK: usize = 16 * 1024;
 
 // Runs units 0..n_units in parallel on rayon, the pool candle's matmuls (gemm)
 // use too. With a pool of their own, element-wise ops and matmuls compete for
@@ -409,6 +409,20 @@ pub fn unary_map_vec_par<
     unary_map_vec(vs, layout, f, f_vec)
 }
 
+/// [`unary_map`] for any `f`, run in parallel on large contiguous inputs. Each
+/// element is still `f` of its input, so the results are the same.
+pub fn unary_map_par<T: Copy + Send + Sync, U: Copy + Send + Sync, F: Fn(T) -> U + Sync>(
+    vs: &[T],
+    layout: &Layout,
+    f: F,
+) -> Vec<U> {
+    unary_map_vec_par(vs, layout, &f, |xs: &[T], ys: &mut [U]| {
+        for (y, &x) in ys.iter_mut().zip(xs) {
+            *y = f(x)
+        }
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn binary_map_vec_par<
     T: Copy + Send + Sync,
@@ -424,21 +438,73 @@ pub fn binary_map_vec_par<
     f_vec: FV,
     f_scalar_vec: FSV,
 ) -> Vec<T> {
-    let el_count = lhs_l.shape().elem_count();
-    if el_count < PAR_ELEMWISE_MIN {
+    if lhs_l.shape().elem_count() < PAR_ELEMWISE_MIN {
         return binary_map_vec(lhs_l, rhs_l, lhs, rhs, f, f_vec, f_scalar_vec);
     }
+    binary_map_par_units(lhs_l, rhs_l, lhs, rhs, f, f_vec, f_scalar_vec)
+}
 
+/// [`binary_map`] for any `f` (comparisons output `u8`), run in parallel on
+/// large inputs. Each element is still `f` of its inputs, so the results are
+/// the same.
+pub fn binary_map_par<T: Copy + Send + Sync, U: Copy + Send + Sync, F: Fn(T, T) -> U + Sync>(
+    lhs_l: &Layout,
+    rhs_l: &Layout,
+    lhs: &[T],
+    rhs: &[T],
+    f: F,
+) -> Vec<U> {
+    if lhs_l.shape().elem_count() < PAR_ELEMWISE_MIN {
+        return binary_map(lhs_l, rhs_l, lhs, rhs, f);
+    }
+    binary_map_par_units(
+        lhs_l,
+        rhs_l,
+        lhs,
+        rhs,
+        &f,
+        |xs: &[T], ys: &[T], out: &mut [U]| {
+            for ((o, &x), &y) in out.iter_mut().zip(xs).zip(ys) {
+                *o = f(x, y)
+            }
+        },
+        |rhs: T, xs: &[T], out: &mut [U]| {
+            for (o, &x) in out.iter_mut().zip(xs) {
+                *o = f(x, rhs)
+            }
+        },
+    )
+}
+
+// The parallel part of binary_map_vec_par and binary_map_par: units of
+// PAR_ELEMWISE_CHUNK output elements in parallel.
+#[allow(clippy::too_many_arguments)]
+fn binary_map_par_units<
+    T: Copy + Send + Sync,
+    U: Copy + Send + Sync,
+    F: Fn(T, T) -> U + Sync,
+    FV: Fn(&[T], &[T], &mut [U]) + Sync,
+    FSV: Fn(T, &[T], &mut [U]) + Sync,
+>(
+    lhs_l: &Layout,
+    rhs_l: &Layout,
+    lhs: &[T],
+    rhs: &[T],
+    f: F,
+    f_vec: FV,
+    f_scalar_vec: FSV,
+) -> Vec<U> {
+    let el_count = lhs_l.shape().elem_count();
     let nd_iter = NdIter::new([lhs_l, rhs_l]);
     let inner_size = nd_iter.inner_size;
     let [lhs_stride, rhs_stride] = nd_iter.inner_strides;
     debug_assert!(inner_size > 0);
 
-    let mut ys: Vec<T> = Vec::with_capacity(el_count);
+    let mut ys: Vec<U> = Vec::with_capacity(el_count);
     let ys_ptr = ys.as_mut_ptr() as usize;
     let n_units = el_count.div_ceil(PAR_ELEMWISE_CHUNK);
     par_units(n_units, |range| {
-        let ys_ptr = ys_ptr as *mut T;
+        let ys_ptr = ys_ptr as *mut U;
         for unit in range {
             let mut dst_offset = unit * PAR_ELEMWISE_CHUNK;
             let hi = el_count.min(dst_offset + PAR_ELEMWISE_CHUNK);
