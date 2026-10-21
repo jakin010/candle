@@ -1,6 +1,8 @@
 //! Traits and methods for CPU-backed Tensors
 #![allow(clippy::needless_range_loop)]
 pub mod erf;
+#[cfg(feature = "fast-gelu")]
+pub mod fast_math;
 pub(crate) mod features;
 pub mod kernels;
 

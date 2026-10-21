@@ -594,9 +594,14 @@ unary_op!(Sqrt, "sqrt", v, v.sqrt(), vs_sqrt, vd_sqrt);
 // Hardcode the value for sqrt(2/pi)
 // https://github.com/huggingface/candle/issues/1982
 #[allow(clippy::excessive_precision)]
-const SQRT_TWO_OVER_PI_F32: f32 = 0.79788456080286535587989211986876373;
+pub(crate) const SQRT_TWO_OVER_PI_F32: f32 = 0.79788456080286535587989211986876373;
 #[allow(clippy::excessive_precision)]
 const SQRT_TWO_OVER_PI_F64: f64 = 0.79788456080286535587989211986876373;
+
+// mkl and accelerate provide their own vectorized f32 `gelu`, which the fast
+// path leaves alone.
+#[cfg(feature = "fast-gelu")]
+const VENDOR_GELU_F32: bool = cfg!(any(feature = "mkl", feature = "accelerate"));
 
 /// Tanh based approximation of the `gelu` operation
 /// GeluErf is the more precise one.
@@ -628,6 +633,10 @@ impl UnaryOpT for Gelu {
     }
     #[inline(always)]
     fn f32(v: f32) -> f32 {
+        #[cfg(feature = "fast-gelu")]
+        if !VENDOR_GELU_F32 && crate::utils::fast_gelu() {
+            return crate::cpu::fast_math::gelu_tanh(v);
+        }
         0.5 * v * (1.0 + f32::tanh(SQRT_TWO_OVER_PI_F32 * v * (1.0 + 0.044715 * v * v)))
     }
     #[inline(always)]
@@ -689,6 +698,23 @@ impl UnaryOpT for Gelu {
     #[inline(always)]
     fn f64_vec(xs: &[f64], ys: &mut [f64]) {
         crate::accelerate::vd_gelu(xs, ys)
+    }
+
+    #[cfg(all(
+        feature = "fast-gelu",
+        not(any(feature = "mkl", feature = "accelerate"))
+    ))]
+    #[inline(always)]
+    fn f32_vec(xs: &[f32], ys: &mut [f32]) {
+        // One check per slice, so the fast loop is free to vectorize.
+        if crate::utils::fast_gelu() {
+            crate::cpu::fast_math::gelu_tanh_vec(xs, ys)
+        } else {
+            for (y, &x) in ys.iter_mut().zip(xs) {
+                *y =
+                    0.5 * x * (1.0 + f32::tanh(SQRT_TWO_OVER_PI_F32 * x * (1.0 + 0.044715 * x * x)))
+            }
+        }
     }
 }
 
@@ -1009,7 +1035,23 @@ impl UnaryOpT for GeluErf {
     }
     #[inline(always)]
     fn f32(v: f32) -> f32 {
+        #[cfg(feature = "fast-gelu")]
+        if crate::utils::fast_gelu() {
+            return crate::cpu::fast_math::gelu_erf(v);
+        }
         (crate::cpu::erf::erf_f32(v * std::f32::consts::FRAC_1_SQRT_2) + 1.) * 0.5 * v
+    }
+    #[cfg(feature = "fast-gelu")]
+    #[inline(always)]
+    fn f32_vec(xs: &[f32], ys: &mut [f32]) {
+        // One check per slice; the fast loop vectorizes, libm's erff does not.
+        if crate::utils::fast_gelu() {
+            crate::cpu::fast_math::gelu_erf_vec(xs, ys)
+        } else {
+            for (y, &x) in ys.iter_mut().zip(xs) {
+                *y = (crate::cpu::erf::erf_f32(x * std::f32::consts::FRAC_1_SQRT_2) + 1.) * 0.5 * x
+            }
+        }
     }
     #[inline(always)]
     fn f64(v: f64) -> f64 {

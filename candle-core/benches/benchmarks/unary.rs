@@ -37,6 +37,45 @@ fn run_unary_benchmark(c: &mut Criterion, device: &Device, dtype: DType, name: &
     group.finish();
 }
 
+#[cfg(feature = "fast-gelu")]
+fn run_gelu_benchmark(c: &mut Criterion, device: &Device, erf: bool, fast: bool, name: &str) {
+    let b = 1;
+    let m = 1024;
+    let k = 1024;
+
+    // Activations in [-5, 5), where both forms of GELU do real work.
+    let tensor = Tensor::arange(0.0f32, (b * m * k) as f32, device)
+        .unwrap()
+        .affine(10.0 / (b * m * k) as f64, -5.0)
+        .unwrap()
+        .reshape((b, m, k))
+        .unwrap();
+
+    let flops = b * m * k * DType::F32.size_in_bytes();
+
+    let mut group = c.benchmark_group(device.bench_name(name));
+    group.throughput(Throughput::Bytes(flops as u64));
+    group.bench_function("iter", move |b| {
+        b.iter_custom(|iters| {
+            let default = candle_core::utils::fast_gelu();
+            candle_core::utils::set_fast_gelu(fast);
+            let start = Instant::now();
+            for _i in 0..iters {
+                if erf {
+                    black_box(&tensor).gelu_erf().unwrap();
+                } else {
+                    black_box(&tensor).gelu().unwrap();
+                }
+            }
+            device.sync().unwrap();
+            let elapsed = start.elapsed();
+            candle_core::utils::set_fast_gelu(default);
+            elapsed
+        })
+    });
+    group.finish();
+}
+
 fn run_cast(a: &Tensor, dtype: DType) {
     a.to_dtype(dtype).unwrap();
 }
@@ -91,6 +130,16 @@ fn criterion_benchmark(c: &mut Criterion) {
         for dtype in [DType::F32, DType::BF16, DType::F16] {
             let name = format!("sqrt_{dtype:?}");
             run_unary_benchmark(c, &device, dtype, &name);
+        }
+        // The fast GELU path (feature `fast-gelu`) only affects the CPU backend.
+        #[cfg(feature = "fast-gelu")]
+        if device.is_cpu() {
+            for (erf, op) in [(false, "gelu"), (true, "gelu_erf")] {
+                for fast in [false, true] {
+                    let name = format!("{op}_f32{}", if fast { "_fast" } else { "" });
+                    run_gelu_benchmark(c, &device, erf, fast, &name);
+                }
+            }
         }
     }
 }
