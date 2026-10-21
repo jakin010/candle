@@ -380,6 +380,13 @@ pub fn init_global_threadpool() {
 }
 
 fn default_num_threads() -> usize {
+    // Every matmul asks for the thread count, and on Linux the core count comes
+    // from parsing /proc/cpuinfo, so compute it once.
+    static DEFAULT: OnceLock<usize> = OnceLock::new();
+    *DEFAULT.get_or_init(detect_num_threads)
+}
+
+fn detect_num_threads() -> usize {
     let physical = {
         #[cfg(target_os = "macos")]
         {
@@ -397,7 +404,12 @@ fn default_num_threads() -> usize {
             num_cpus::get_physical()
         }
     };
-    physical.max(1) // safeguard against bad number
+    // The counts above describe the whole machine. The process may be allowed
+    // fewer CPUs: its affinity mask (taskset) or, in a container, a cgroup CPU
+    // quota, both of which `available_parallelism` reports. More threads than
+    // that only time-slice, and spinning workers burn the quota.
+    let allowed = std::thread::available_parallelism().map_or(physical, |n| n.get());
+    physical.min(allowed).max(1) // safeguard against bad number
 }
 
 fn rayon_num_threads() -> usize {
@@ -613,6 +625,23 @@ pub fn with_simd128() -> bool {
 
 pub fn with_f16c() -> bool {
     crate::cpu::features::get().f16c
+}
+
+#[cfg(test)]
+mod thread_count_tests {
+    use super::default_num_threads;
+
+    #[test]
+    fn default_thread_count_fits_the_allowed_cpus() {
+        // available_parallelism covers the affinity mask and a cgroup CPU quota.
+        let allowed = std::thread::available_parallelism().map_or(usize::MAX, |n| n.get());
+        let threads = default_num_threads();
+        assert!(
+            (1..=allowed).contains(&threads),
+            "{threads} threads for {allowed} allowed CPUs"
+        );
+        assert_eq!(default_num_threads(), threads);
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
