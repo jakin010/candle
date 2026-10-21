@@ -1499,10 +1499,9 @@ impl Map2 for MatMul {
             // over itself, so a stride-zero batch on lhs goes through the loop below.
             (b, m, n, k)
         };
-        for step in 0..b {
+        let gemm_step = |step: usize, dst_p: &mut [T], parallelism: Parallelism| {
             let lhs_p = &lhs[step * a_skip..];
             let rhs_p = &rhs[step * b_skip..];
-            let dst_p = &mut dst[step * c_skip..];
             unsafe {
                 gemm(
                     /* m: usize = */ m,
@@ -1525,6 +1524,20 @@ impl Map2 for MatMul {
                     /* conj_rhs: bool = */ false,
                     parallelism,
                 )
+            }
+        };
+        if num_threads > 1 && b >= num_threads && c_skip > 0 {
+            // At least one product per thread (attention: batch * heads small
+            // matrices): give each thread whole products instead of splitting
+            // every small product across all threads, which costs a fork-join
+            // per product. gemm computes each element the same way either way,
+            // so the results are identical.
+            dst.par_chunks_mut(c_skip)
+                .enumerate()
+                .for_each(|(step, dst_p)| gemm_step(step, dst_p, Parallelism::None));
+        } else {
+            for step in 0..b {
+                gemm_step(step, &mut dst[step * c_skip..], parallelism);
             }
         }
         Ok(dst)

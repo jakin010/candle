@@ -222,6 +222,33 @@ fn tensor_mv() -> Result<()> {
     Ok(())
 }
 
+// With at least one product per thread, the CPU backend runs whole products in
+// parallel instead of splitting each one across threads; the results must not
+// change.
+#[test]
+fn batched_matmul_matches_single_matmuls() -> Result<()> {
+    let dev = &Device::Cpu;
+    let b = 2 * candle_core::utils::get_num_threads().max(2);
+    // Attention-sized, large enough for gemm to split a single product over threads.
+    let (m, k, n) = (197, 64, 197);
+    let lhs = Tensor::randn(0f32, 1., (b, m, k), dev)?;
+    let rhs = Tensor::randn(0f32, 1., (b, k, n), dev)?;
+    // q @ k^T: a transposed rhs layout, as attention scores use.
+    let rhs_t = Tensor::randn(0f32, 1., (b, n, k), dev)?.transpose(1, 2)?;
+    for rhs in [rhs, rhs_t] {
+        let batched = lhs.matmul(&rhs)?;
+        for i in 0..b {
+            let single = lhs.i(i)?.matmul(&rhs.i(i)?)?;
+            assert_eq!(
+                batched.i(i)?.flatten_all()?.to_vec1::<f32>()?,
+                single.flatten_all()?.to_vec1::<f32>()?,
+                "product {i}"
+            );
+        }
+    }
+    Ok(())
+}
+
 // https://github.com/huggingface/candle/issues/1948
 fn squeeze_mm(device: &Device) -> Result<()> {
     let seq_len = 8_usize;
